@@ -148,4 +148,3 @@ function ViewNoteModal({
 }
 
 export default ViewNoteModal
-git status
