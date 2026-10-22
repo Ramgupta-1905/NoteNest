@@ -1,4 +1,5 @@
-import { useState } from 'react'
+
+import { useCallback, useEffect, useState } from 'react'
 import './App.css'
 
 import AuthModal from './components/auth/AuthModal.jsx'
@@ -9,11 +10,43 @@ import NotesGrid from './components/NotesGrid.jsx'
 import AddNoteModal from './components/AddNoteModal.jsx'
 import ViewNoteModal from './components/ViewNoteModal.jsx'
 
-import { initialNotes, availableColors } from './data/initialNotes.js'
-import { createNote, updateNote } from './services/noteService.js'
+import { availableColors } from './data/initialNotes.js'
+import {
+  getNotes,
+  createNote,
+  updateNote,
+  deleteNote,
+  restoreNote,
+  permanentlyDeleteNote,
+  clearTrash,
+} from './services/noteService.js'
+
+// Convert the backend's note data into the format used by the UI.
+function formatNote(note) {
+  const createdAt = note.createdAt || note.created_at
+
+  return {
+    ...note,
+    id: note.id,
+    isFavorite: note.isFavorite ?? false,
+    isDeleted: note.isDeleted ?? false,
+    date: createdAt
+      ? new Date(createdAt).toLocaleDateString('en-US', {
+          month: 'short',
+          day: 'numeric',
+          year: 'numeric',
+        })
+      : '',
+  }
+}
+
+// Some API routes return a note directly; others return { note: ... }.
+function extractNote(response) {
+  return response?.note ?? response
+}
 
 function App() {
-  const [notes, setNotes] = useState(initialNotes)
+  const [notes, setNotes] = useState([])
   const [trash, setTrash] = useState([])
   const [search, setSearch] = useState('')
   const [sortOrder, setSortOrder] = useState('newest')
@@ -25,6 +58,38 @@ function App() {
 
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [isDarkMode, setIsDarkMode] = useState(false)
+  const [isLoading, setIsLoading] = useState(true)
+  const [errorMessage, setErrorMessage] = useState('')
+  const [isSaving, setIsSaving] = useState(false)
+
+  const loadNotes = useCallback(async (showLoading = false) => {
+    if (showLoading) {
+      setIsLoading(true)
+    }
+
+    try {
+      setErrorMessage('')
+
+      const [activeNotes, trashedNotes] = await Promise.all([
+        getNotes(),
+        getNotes('trash'),
+      ])
+
+      setNotes(activeNotes.map(formatNote))
+      setTrash(trashedNotes.map(formatNote))
+    } catch (error) {
+      console.error('Error loading notes:', error)
+      setErrorMessage(
+        'Unable to load notes. Please check that the backend and database are running.',
+      )
+    } finally {
+      setIsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadNotes(true)
+  }, [loadNotes])
 
   function getNoteId(noteOrId) {
     return noteOrId !== null && typeof noteOrId === 'object'
@@ -65,19 +130,43 @@ function App() {
     setNoteToEdit(null)
   }
 
-  function handleSaveNote(noteData) {
-    if (noteToEdit) {
-      setNotes((currentNotes) =>
-        updateNote(currentNotes, noteToEdit.id, {
-          ...noteData,
-          color: noteToEdit.color,
+  // Create a note or save changes to an existing note.
+  async function handleSaveNote(noteData) {
+    if (isSaving) return
+
+    setIsSaving(true)
+    setErrorMessage('')
+
+    try {
+      if (noteToEdit) {
+        const updatedData = {
+          title: noteData.title.trim(),
+          content: noteData.content.trim(),
+          color: noteToEdit.color || 'blue',
           isFavorite: noteToEdit.isFavorite ?? false,
-        }),
-      )
-    } else {
-      setNotes((currentNotes) => {
+        }
+
+        const response = await updateNote(
+          noteToEdit.id,
+          updatedData,
+        )
+
+        const savedNote = formatNote(extractNote(response))
+
+        setNotes((currentNotes) =>
+          currentNotes.map((note) =>
+            idsMatch(note, savedNote.id) ? savedNote : note,
+          ),
+        )
+
+        setSelectedNote((current) =>
+          current && idsMatch(current, savedNote.id)
+            ? savedNote
+            : current,
+        )
+      } else {
         const usedColors = new Set(
-          currentNotes.map((note) => note.color),
+          notes.map((note) => note.color),
         )
 
         const unusedColors = availableColors.filter(
@@ -92,21 +181,39 @@ function App() {
         const color =
           colorPool[
             Math.floor(Math.random() * colorPool.length)
-          ]
+          ] || 'blue'
 
-        return createNote(currentNotes, {
+        const response = await createNote({
           ...noteData,
+          title: noteData.title.trim(),
+          content: noteData.content.trim(),
           color,
           isFavorite: false,
         })
-      })
-    }
 
-    handleCloseModal()
+        const savedNote = formatNote(extractNote(response))
+
+        setNotes((currentNotes) => [
+          savedNote,
+          ...currentNotes.filter(
+            (note) => !idsMatch(note, savedNote.id),
+          ),
+        ])
+      }
+
+      handleCloseModal()
+    } catch (error) {
+      console.error('Error saving note:', error)
+      setErrorMessage(
+        'Unable to save your note. Please try again.',
+      )
+    } finally {
+      setIsSaving(false)
+    }
   }
 
-  // Move a note from All Notes or Favourites to Trash.
-  function handleMoveToTrash(noteOrId) {
+  // Move an active note to Trash.
+  async function handleMoveToTrash(noteOrId) {
     const noteId = getNoteId(noteOrId)
 
     const noteToMove = notes.find((note) =>
@@ -124,25 +231,36 @@ function App() {
 
     if (!confirmed) return false
 
-    setNotes((currentNotes) =>
-      currentNotes.filter(
-        (note) => !idsMatch(note, noteId),
-      ),
-    )
+    try {
+      setErrorMessage('')
+      await deleteNote(noteId)
 
-    setTrash((currentTrash) => [
-      { ...noteToMove },
-      ...currentTrash.filter(
-        (note) => !idsMatch(note, noteId),
-      ),
-    ])
+      setNotes((currentNotes) =>
+        currentNotes.filter(
+          (note) => !idsMatch(note, noteId),
+        ),
+      )
 
-    setSelectedNote(null)
-    return true
+      setTrash((currentTrash) => [
+        { ...noteToMove, isDeleted: true },
+        ...currentTrash.filter(
+          (note) => !idsMatch(note, noteId),
+        ),
+      ])
+
+      setSelectedNote(null)
+      return true
+    } catch (error) {
+      console.error('Error moving note to Trash:', error)
+      setErrorMessage(
+        'Unable to move the note to Trash. Please try again.',
+      )
+      return false
+    }
   }
 
-  // Permanently delete a note from Trash.
-  function handlePermanentDelete(noteOrId) {
+  // Permanently delete a note that is already in Trash.
+  async function handlePermanentDelete(noteOrId) {
     const noteId = getNoteId(noteOrId)
 
     const noteInTrash = trash.find((note) =>
@@ -160,14 +278,25 @@ function App() {
 
     if (!confirmed) return false
 
-    setTrash((currentTrash) =>
-      currentTrash.filter(
-        (note) => !idsMatch(note, noteId),
-      ),
-    )
+    try {
+      setErrorMessage('')
+      await permanentlyDeleteNote(noteId)
 
-    setSelectedNote(null)
-    return true
+      setTrash((currentTrash) =>
+        currentTrash.filter(
+          (note) => !idsMatch(note, noteId),
+        ),
+      )
+
+      setSelectedNote(null)
+      return true
+    } catch (error) {
+      console.error('Error permanently deleting note:', error)
+      setErrorMessage(
+        'Unable to permanently delete the note. Please try again.',
+      )
+      return false
+    }
   }
 
   function handleDeleteNote(noteOrId) {
@@ -178,7 +307,7 @@ function App() {
     return handleMoveToTrash(noteOrId)
   }
 
-  function handleDeleteFromView(noteOrId) {
+  async function handleDeleteFromView(noteOrId) {
     const noteId = getNoteId(noteOrId)
 
     if (trash.some((note) => idsMatch(note, noteId))) {
@@ -188,7 +317,8 @@ function App() {
     return handleMoveToTrash(noteId)
   }
 
-  function handleRestoreNote(noteOrId) {
+  // Restore a trashed note through the backend.
+  async function handleRestoreNote(noteOrId) {
     const noteId = getNoteId(noteOrId)
 
     const noteToRestore = trash.find((note) =>
@@ -200,23 +330,35 @@ function App() {
       return
     }
 
-    setTrash((currentTrash) =>
-      currentTrash.filter(
-        (note) => !idsMatch(note, noteId),
-      ),
-    )
+    try {
+      setErrorMessage('')
+      const response = await restoreNote(noteId)
+      const restoredNote = formatNote(extractNote(response))
 
-    setNotes((currentNotes) => [
-      { ...noteToRestore },
-      ...currentNotes.filter(
-        (note) => !idsMatch(note, noteId),
-      ),
-    ])
+      setTrash((currentTrash) =>
+        currentTrash.filter(
+          (note) => !idsMatch(note, noteId),
+        ),
+      )
 
-    setSelectedNote(null)
+      setNotes((currentNotes) => [
+        restoredNote,
+        ...currentNotes.filter(
+          (note) => !idsMatch(note, noteId),
+        ),
+      ])
+
+      setSelectedNote(null)
+    } catch (error) {
+      console.error('Error restoring note:', error)
+      setErrorMessage(
+        'Unable to restore the note. Please try again.',
+      )
+    }
   }
 
-  function handleClearTrash() {
+  // Permanently delete every note currently in Trash.
+  async function handleClearTrash() {
     if (trash.length === 0) return
 
     const confirmed = window.confirm(
@@ -225,25 +367,59 @@ function App() {
 
     if (!confirmed) return
 
-    setTrash([])
-    setSelectedNote(null)
+    try {
+      setErrorMessage('')
+      await clearTrash()
+
+      setTrash([])
+      setSelectedNote(null)
+    } catch (error) {
+      console.error('Error clearing Trash:', error)
+      setErrorMessage(
+        'Unable to clear Trash. Please try again.',
+      )
+    }
   }
 
-  function handleToggleFavorite(noteOrId) {
+  // Save favorite changes to PostgreSQL.
+  async function handleToggleFavorite(noteOrId) {
     if (activeView === 'trash') return
 
     const noteId = getNoteId(noteOrId)
+    const note = notes.find((item) => idsMatch(item, noteId))
 
-    setNotes((currentNotes) =>
-      currentNotes.map((note) =>
-        idsMatch(note, noteId)
-          ? {
-              ...note,
-              isFavorite: !note.isFavorite,
-            }
-          : note,
-      ),
-    )
+    if (!note) return
+
+    const updatedData = {
+      title: note.title,
+      content: note.content,
+      color: note.color || 'blue',
+      isFavorite: !note.isFavorite,
+    }
+
+    try {
+      setErrorMessage('')
+
+      const response = await updateNote(noteId, updatedData)
+      const savedNote = formatNote(extractNote(response))
+
+      setNotes((currentNotes) =>
+        currentNotes.map((item) =>
+          idsMatch(item, noteId) ? savedNote : item,
+        ),
+      )
+
+      setSelectedNote((current) =>
+        current && idsMatch(current, noteId)
+          ? savedNote
+          : current,
+      )
+    } catch (error) {
+      console.error('Error updating favorite:', error)
+      setErrorMessage(
+        'Unable to update favorite status. Please try again.',
+      )
+    }
   }
 
   function handleToggleDarkMode() {
@@ -269,11 +445,18 @@ function App() {
         note.title.toLowerCase().includes(query) ||
         note.content.toLowerCase().includes(query),
     )
-    .sort((a, b) =>
-      sortOrder === 'newest'
-        ? Number(b.id) - Number(a.id)
-        : Number(a.id) - Number(b.id),
-    )
+    .sort((a, b) => {
+      const aTime = new Date(
+        a.createdAt || a.created_at || 0,
+      ).getTime()
+      const bTime = new Date(
+        b.createdAt || b.created_at || 0,
+      ).getTime()
+
+      return sortOrder === 'newest'
+        ? bTime - aTime
+        : aTime - bTime
+    })
 
   const selectedNoteId = selectedNote?.id
 
@@ -329,6 +512,25 @@ function App() {
           isDarkMode={isDarkMode}
         />
 
+        {errorMessage && (
+          <div
+            role="alert"
+            className="my-4 rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700"
+          >
+            <div className="flex items-center justify-between gap-3">
+              <p>{errorMessage}</p>
+              <button
+                type="button"
+                onClick={() => setErrorMessage('')}
+                className="shrink-0 font-semibold"
+                aria-label="Dismiss error"
+              >
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+
         <section>
           <div className="mb-6">
             <h1
@@ -352,17 +554,26 @@ function App() {
             </p>
           </div>
 
-          <NotesGrid
-            notes={filteredNotes}
-            onToggleFavorite={handleToggleFavorite}
-            onEditNote={handleOpenEditModal}
-            onDeleteNote={handleDeleteNote}
-            onCreateNote={handleOpenCreateModal}
-            onRestoreNote={handleRestoreNote}
-            onViewNote={handleOpenViewNote}
-            isTrash={activeView === 'trash'}
-            isDarkMode={isDarkMode}
-          />
+          {isLoading ? (
+            <div
+              className="rounded-2xl p-8 text-center text-sm text-slate-500"
+              role="status"
+            >
+              Loading your notes...
+            </div>
+          ) : (
+            <NotesGrid
+              notes={filteredNotes}
+              onToggleFavorite={handleToggleFavorite}
+              onEditNote={handleOpenEditModal}
+              onDeleteNote={handleDeleteNote}
+              onCreateNote={handleOpenCreateModal}
+              onRestoreNote={handleRestoreNote}
+              onViewNote={handleOpenViewNote}
+              isTrash={activeView === 'trash'}
+              isDarkMode={isDarkMode}
+            />
+          )}
         </section>
       </main>
 
@@ -383,6 +594,7 @@ function App() {
           onSave={handleSaveNote}
           noteToEdit={noteToEdit}
           isDarkMode={isDarkMode}
+          isSaving={isSaving}
         />
       )}
 
